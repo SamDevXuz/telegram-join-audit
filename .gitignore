@@ -1,0 +1,7 @@
+*.session
+*.session-journal
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+.venv/
