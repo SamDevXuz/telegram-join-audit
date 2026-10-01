@@ -1,8 +1,8 @@
-"""SQLite saqlash + join-request tahlil dvigateli.
+"""Хранилище SQLite + движок анализа заявок на вступление.
 
-Bu modul Telegram'ga bog'liq emas — uni alohida test qilish mumkin.
-Asosiy vazifa: pending join request'lar ro'yxatidan ommaviy yaratilgan
-akkauntlar izini topish.
+Модуль не зависит от Telegram — его можно тестировать отдельно.
+Задача: найти в списке ожидающих заявок следы массово созданных
+аккаунтов.
 """
 
 import re
@@ -17,7 +17,7 @@ import config
 
 
 # ================================================================
-# SAQLASH
+# ХРАНЕНИЕ
 # ================================================================
 
 db = sqlite3.connect(config.DB_FILE, check_same_thread=False)
@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS declines (
     PRIMARY KEY (channel_id, user_id)
 );
 
--- Chuqur tekshiruv natijasi. Skanga emas, akkauntga bog'langan —
--- qayta skanerlagandan keyin ham saqlanib qoladi.
+-- Результат глубокой проверки. Привязан к аккаунту, а не к скану —
+-- переживает повторное сканирование.
 CREATE TABLE IF NOT EXISTS profiles (
     user_id     INTEGER PRIMARY KEY,
     photo_count INTEGER,
@@ -74,8 +74,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     checked_at  TEXT NOT NULL
 );
 
--- Dalil panelini ko'rishga ruxsat. Kod bir martalik: birinchi ishlatgan
--- akkauntga biriktiriladi, keyin boshqa hech kim u bilan kira olmaydi.
+-- Доступ к панели доказательств. Код одноразовый: закрепляется за тем,
+-- кто первым его ввёл, после чего никто другой по нему не войдёт.
 CREATE TABLE IF NOT EXISTS guest_codes (
     code       TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -85,11 +85,11 @@ CREATE TABLE IF NOT EXISTS guest_codes (
     used_at    TEXT
 );
 
--- Jonli kuzatuv. Skaner mavjud navbatni o'qiydi, bu esa kelayotgan har bir
--- so'rovni o'sha zahoti yozadi. Ikki muhim farqi bor:
---   1. Bot admin bo'lsa yetarli — userbot sessiyasi kerak emas.
---   2. So'rov QAYSI havola orqali kelganini ham biladi, ya'ni traffikni
---      sotuvchi bo'yicha ajratish mumkin.
+-- Наблюдение в реальном времени. Сканер читает уже существующую очередь,
+-- а это пишет каждую заявку в момент прихода. Два важных отличия:
+--   1. Достаточно прав администратора у бота — сессия user-аккаунта не нужна.
+--   2. Известно, ПО КАКОЙ ссылке пришла заявка, то есть трафик можно
+--      разделить по продавцам.
 CREATE TABLE IF NOT EXISTS live_requests (
     channel_id   INTEGER NOT NULL,
     user_id      INTEGER NOT NULL,
@@ -109,10 +109,10 @@ CREATE TABLE IF NOT EXISTS live_requests (
     PRIMARY KEY (channel_id, user_id)
 );
 
--- Sotuvchi bo'yicha atributsiya. Telegram yangilanish ichida havolani
--- KESIB yuboradi ("https://t.me/+kHGCZCH1..."), to'liq shaklni faqat
--- havolani o'zi yaratgan botga beradi. Shuning uchun to'liq havola shu
--- yerda saqlanadi, kelgan so'rov esa prefiks bo'yicha solishtiriladi.
+-- Атрибуция по продавцу. В апдейте Telegram ОБРЕЗАЕТ ссылку
+-- ("https://t.me/+kHGCZCH1..."), полную форму отдаёт только тому боту,
+-- который сам её создал. Поэтому полная ссылка хранится здесь, а
+-- пришедшая заявка сопоставляется по префиксу.
 CREATE TABLE IF NOT EXISTS sellers (
     channel_id INTEGER NOT NULL,
     prefix     TEXT NOT NULL,
@@ -123,8 +123,8 @@ CREATE TABLE IF NOT EXISTS sellers (
     PRIMARY KEY (channel_id, prefix)
 );
 
--- Begona odam /start bosib qiziqish bildirsa shu yerga tushadi.
--- Maqsadi — egaga bir martagina xabar berish va aloqani yo'qotmaslik.
+-- Сюда попадает посторонний, нажавший /start и проявивший интерес.
+-- Смысл — один раз уведомить владельца и не потерять контакт.
 CREATE TABLE IF NOT EXISTS leads (
     user_id    INTEGER PRIMARY KEY,
     username   TEXT,
@@ -138,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_guest_used ON guest_codes(used_by);
 CREATE INDEX IF NOT EXISTS idx_live_date ON live_requests(channel_id, request_date);
 """
 
-# v1 bazasida bu ustunlar yo'q edi — ishga tushganda qo'shiladi
+# В базе v1 этих колонок не было — добавляются при запуске
 EXTRA_COLUMNS = {
     "has_photo": "INTEGER DEFAULT 0",
     "is_premium": "INTEGER DEFAULT 0",
@@ -157,8 +157,8 @@ def init():
         if name not in have:
             db.execute(f"ALTER TABLE requests ADD COLUMN {name} {ddl}")
 
-    # Rasm ma'lumoti avval requests ichida edi. Endi u profiles jadvalida —
-    # eski ustunlar qolsa scan_rows dagi JOIN bilan nom to'qnashadi.
+    # Данные о фото раньше лежали в requests. Теперь они в profiles —
+    # если старые колонки останутся, имена столкнутся с JOIN в scan_rows.
     for name in ("photo_count", "photo_date"):
         if name in have:
             db.execute(f"ALTER TABLE requests DROP COLUMN {name}")
@@ -185,10 +185,10 @@ def clear_setting(key):
 
 
 def guest_scan_id():
-    """Mehmon panelida qotirilgan skan. None bo'lsa — oxirgisi ko'rsatiladi.
+    """Скан, закреплённый в гостевой панели. None — показывается последний.
 
-    Tozalash dalilni kamaytiradi (rad etilgan akkauntlar ro'yxatdan chiqadi),
-    shuning uchun tozalashdan oldingi skanni qotirib qo'yish kerak bo'ladi.
+    Чистка уменьшает доказательную базу (отклонённые аккаунты уходят из
+    списка), поэтому скан, сделанный до чистки, имеет смысл закрепить.
     """
     value = get_setting("guest_scan_id")
     return int(value) if value else None
@@ -260,7 +260,7 @@ def scan_by_id(scan_id):
 
 
 def later_scans(channel_id, scan_id):
-    """Berilgan skandan keyingi tugallangan skanlar — eskidan yangiga."""
+    """Завершённые сканы после указанного — от старых к новым."""
     return db.execute(
         "SELECT * FROM scans WHERE channel_id = ? AND id > ? "
         "AND status = 'completed' ORDER BY id",
@@ -286,7 +286,7 @@ def scan_rows(scan_id):
 
 
 def log_declines(channel_id, entries):
-    """Rad etilganlarni yozib qo'yadi — keyin kimni rad etganingiz ma'lum bo'lsin."""
+    """Пишет отклонённых — чтобы потом было известно, кого именно отклонили."""
     db.executemany(
         "INSERT OR REPLACE INTO declines"
         "(channel_id, user_id, username, risk, declined_at) VALUES (?, ?, ?, ?, ?)",
@@ -297,7 +297,7 @@ def log_declines(channel_id, entries):
 
 
 def save_photo_info(entries):
-    """Chuqur tekshiruv natijasi: (user_id, rasm soni, eng eski rasm sanasi)."""
+    """Результат глубокой проверки: (user_id, число фото, дата самой старой)."""
     db.executemany(
         "INSERT OR REPLACE INTO profiles"
         "(user_id, photo_count, photo_date, checked_at) VALUES (?, ?, ?, ?)",
@@ -313,7 +313,7 @@ def decline_count(channel_id):
 
 
 def decline_log(channel_id):
-    """Rad etilganlar vaqt bo'yicha. Mehmon paneli shundan tarix yasaydi."""
+    """Отклонённые по времени. Гостевая панель строит из этого историю."""
     return db.execute(
         "SELECT user_id, username, risk, declined_at FROM declines "
         "WHERE channel_id = ? ORDER BY declined_at",
@@ -322,7 +322,7 @@ def decline_log(channel_id):
 
 
 # ================================================================
-# JONLI OQIM
+# ПОТОК В РЕАЛЬНОМ ВРЕМЕНИ
 # ================================================================
 
 LIVE_FIELDS = (
@@ -333,19 +333,17 @@ LIVE_FIELDS = (
 
 
 def record_live(channel_id, item):
-    """Kelgan bitta so'rovni yozadi. Yangi so'rov bo'lsa True qaytaradi.
+    """Пишет одну пришедшую заявку. Возвращает True, если заявка новая.
 
-    `item` — LIVE_FIELDS dagi channel_id dan keyingi qiymatlar ketma-ketligi.
+    `item` — значения LIVE_FIELDS, идущие после channel_id.
 
-    Telegram'da bitta akkauntning bitta kanalda faqat BITTA kutayotgan
-    so'rovi bo'ladi, shuning uchun qator har akkauntga bittadan. Lekin
-    rad etilgan akkaunt qayta so'rov yuborishi mumkin — ehtimol boshqa
-    sotuvchining havolasi orqali. Shuning uchun sanasi yangiroq so'rov
-    eskisini almashtiradi; aks holda qayta quyish eski sotuvchiga
-    yozilib qolardi.
+    У одного аккаунта в одном канале может быть только ОДНА ожидающая
+    заявка, поэтому строка на аккаунт одна. Но отклонённый аккаунт может
+    подать заявку повторно — возможно, уже по ссылке другого продавца.
+    Поэтому заявка с более свежей датой заменяет старую; иначе повторный
+    залив записался бы на прежнего продавца.
 
-    Aynan o'sha sana kelsa — bu Telegram'ning takroriy yangilanishi,
-    e'tiborsiz qoldiriladi.
+    Если дата та же самая — это повторный апдейт Telegram, игнорируется.
     """
     user_id, request_date = item[0], item[1]
     seen = db.execute(
@@ -367,10 +365,10 @@ def record_live(channel_id, item):
 
 
 def live_rows(channel_id, since=None):
-    """Jonli yozuvlar — analyze() tushunadigan shaklda.
+    """Живые записи — в форме, которую понимает analyze().
 
-    profiles bilan birlashtiriladi, ya'ni chuqur tekshiruv o'tgan akkauntlar
-    uchun rasm ma'lumoti bu yerda ham ko'rinadi.
+    Джойнятся с profiles, то есть для аккаунтов, прошедших глубокую
+    проверку, данные о фото видны и здесь.
     """
     sql = (
         "SELECT l.*, p.photo_count, p.photo_date FROM live_requests l"
@@ -391,9 +389,9 @@ def live_count(channel_id):
 
 
 def live_links(channel_id):
-    """Havola bo'yicha hisob — qaysi sotuvchi qancha olib kelgani.
+    """Подсчёт по ссылкам — кто из продавцов сколько привёл.
 
-    Qaytaradi: (havola, nomi, soni) ro'yxati, ko'pdan ozga.
+    Возвращает список (ссылка, название, количество), от большего к меньшему.
     """
     return db.execute(
         "SELECT invite_link, invite_title, COUNT(*) AS n FROM live_requests "
@@ -403,20 +401,20 @@ def live_links(channel_id):
 
 
 # ================================================================
-# SOTUVCHILAR (ATRIBUTSIYA)
+# ПРОДАВЦЫ (АТРИБУЦИЯ)
 # ================================================================
 #
-# Telegram yangilanishda havolani kesib beradi: "https://t.me/+kHGCZCH1..."
-# — ya'ni "https://t.me/+" va hash'ning 8 belgisi. To'liq havolani faqat
-# uni yaratgan bot ko'ra oladi. Shuning uchun havolani botning o'zi
-# yaratadi, to'lig'ini bu yerga yozadi, kelgan so'rovni esa prefiks
-# bo'yicha topadi. 8 belgi ~48 bit — bir kanal ichida to'qnashuv bo'lmaydi.
+# В апдейте Telegram отдаёт ссылку обрезанной: "https://t.me/+kHGCZCH1..."
+# — то есть "https://t.me/+" и 8 символов хеша. Полную ссылку видит только
+# тот бот, который её создал. Поэтому ссылку создаёт сам бот, полную форму
+# пишет сюда, а пришедшую заявку находит по префиксу. 8 символов ~48 бит —
+# в пределах одного канала коллизий не будет.
 
 LINK_PREFIX_LEN = 22
 
 
 def link_prefix(link):
-    """Kesik va to'liq havolani bitta solishtirish kalitiga keltiradi."""
+    """Приводит обрезанную и полную ссылку к общему ключу сравнения."""
     return link[:LINK_PREFIX_LEN] if link else None
 
 
@@ -437,10 +435,10 @@ def sellers(channel_id):
 
 
 def revoke_seller(channel_id, prefix):
-    """Havolani bekor qilingan deb belgilaydi.
+    """Помечает ссылку как отозванную.
 
-    Qator o'chirilmaydi — u orqali kelgan eski so'rovlar tarixda qoladi,
-    aks holda atributsiya yo'qoladi.
+    Строка не удаляется — иначе потеряется атрибуция старых заявок,
+    пришедших по ней.
     """
     db.execute(
         "UPDATE sellers SET revoked_at = ? WHERE channel_id = ? AND prefix = ?",
@@ -450,11 +448,11 @@ def revoke_seller(channel_id, prefix):
 
 
 # ================================================================
-# MEHMON KODLARI
+# ГОСТЕВЫЕ КОДЫ
 # ================================================================
 
 def new_guest_code(note=None):
-    """Bir martalik kod yaratadi va qaytaradi."""
+    """Создаёт и возвращает одноразовый код."""
     code = secrets.token_hex(4)
     db.execute(
         "INSERT INTO guest_codes(code, created_at, note) VALUES (?, ?, ?)",
@@ -465,10 +463,10 @@ def new_guest_code(note=None):
 
 
 def redeem_guest_code(code, user_id, name):
-    """Kodni akkauntga biriktiradi.
+    """Закрепляет код за аккаунтом.
 
-    Qaytaradi: "ok" | "used" (boshqa akkaunt olgan) | "expired" | "bad".
-    O'sha akkaunt qayta kiritsa yana "ok" — kod yo'qolib qolmaydi.
+    Возвращает: "ok" | "used" (занят другим аккаунтом) | "expired" | "bad".
+    Если тот же аккаунт введёт код повторно — снова "ok", код не теряется.
     """
     row = db.execute(
         "SELECT * FROM guest_codes WHERE code = ?", (code.strip().lower(),)
@@ -492,7 +490,7 @@ def redeem_guest_code(code, user_id, name):
 
 
 def guest_name(user_id):
-    """Mehmon bo'lsa — ismi, bo'lmasa None."""
+    """Имя, если это гость, иначе None."""
     row = db.execute(
         "SELECT used_name FROM guest_codes WHERE used_by = ? "
         "ORDER BY used_at DESC LIMIT 1",
@@ -517,16 +515,16 @@ def guest_codes():
 
 
 def revoke_guests():
-    """Hamma mehmon kodini o'chiradi — kirish darhol yopiladi."""
+    """Удаляет все гостевые коды — доступ закрывается немедленно."""
     cur = db.execute("DELETE FROM guest_codes")
     db.commit()
     return cur.rowcount
 
 
 def add_lead(user_id, username, name):
-    """Qiziquvchini yozadi. Birinchi marta bo'lsa True — faqat shunda
-    egaga xabar boradi, aks holda bitta odam tugmani bosaverib
-    egani ko'mib tashlashi mumkin edi."""
+    """Пишет заинтересовавшегося. True только в первый раз — лишь тогда
+    уходит уведомление владельцу, иначе один человек мог бы завалить его
+    сообщениями, просто нажимая кнопку."""
     if db.execute(
         "SELECT 1 FROM leads WHERE user_id = ?", (user_id,)
     ).fetchone():
@@ -550,7 +548,7 @@ def scan_user_ids(scan_id):
 
 
 # ================================================================
-# VAQT
+# ВРЕМЯ
 # ================================================================
 
 def now_utc():
@@ -570,7 +568,7 @@ def local(value):
 
 
 # ================================================================
-# USERNAME OILALARI
+# СЕМЕЙСТВА USERNAME
 # ================================================================
 
 # "userpn12003" -> ("userpn", 12003)
@@ -578,7 +576,7 @@ _SPLIT = re.compile(r"^(.*?)(\d+)$")
 
 
 def split_username(username):
-    """Username oxiridagi raqamni ajratadi. Prefiks topilmasa (None, None)."""
+    """Отделяет цифры на конце username. Если основы нет — (None, None)."""
     if not username:
         return None, None
     m = _SPLIT.match(username.lower())
@@ -590,19 +588,21 @@ def split_username(username):
     return prefix, int(digits)
 
 
-# "behzod6385", "ruslanpn66344" — faqat kichik harf, ajratuvchisiz, 3-5 raqam.
-# Tirik odamlar odatda bosh harf yoki pastki chiziq ishlatadi:
+# "behzod6385", "ruslanpn66344" — только строчные, без разделителей, 3-5 цифр.
+# Живые люди обычно используют заглавную букву или подчёркивание:
 # "Abrorbek_Sobirov1701", "Sardor221109", "STARxUZB374".
 _GENERATED = re.compile(r"^[a-z]+\d{3,5}$")
 
-# Shu oraliqdagi raqam tug'ilgan yil bo'lishi mumkin — haqiqiy odam belgisi.
+# Число из этого диапазона может быть годом рождения — признак живого человека.
 BIRTH_YEARS = range(1980, 2013)
 
 
 def is_generated(username, is_premium=False):
-    """Username generator izini ko'rsatadimi?
+    """Есть ли в username след генератора?
 
-    Premium akkaunt hisobga olinmaydi — u pul to'langan, ya'ni tirik odam.
+    Premium-аккаунты не трогаем: за Premium заплачены деньги. Это не
+    доказательство, что человек живой, но достаточная причина не трогать
+    аккаунт автоматическим правилом.
     """
     if not username or is_premium:
         return False
@@ -614,7 +614,7 @@ def is_generated(username, is_premium=False):
 
 @dataclass
 class Family:
-    """Bir xil prefiks + raqam bilan tugaydigan usernamelar to'plami."""
+    """Набор username с общей основой, заканчивающихся цифрами."""
 
     prefix: str = ""
     numbers: list = field(default_factory=list)
@@ -635,14 +635,14 @@ class Family:
 
     @property
     def density(self):
-        """Raqam oralig'ining necha foizi band. 1.0 = to'liq ketma-ket."""
+        """Какая доля числового диапазона занята. 1.0 = строго подряд."""
         span = self.hi - self.lo + 1
         return self.count / span if span > 0 else 1.0
 
 
 @dataclass
 class Window:
-    """Yonma-yon to'lqin daqiqalaridan iborat bitta "quyish seansi"."""
+    """Одна «сессия залива» — склеенные соседние горячие минуты."""
 
     minutes: list = field(default_factory=list)
     rows: list = field(default_factory=list)
@@ -669,7 +669,7 @@ class Window:
 
 
 # ================================================================
-# TAHLIL NATIJASI
+# РЕЗУЛЬТАТ АНАЛИЗА
 # ================================================================
 
 @dataclass
@@ -724,7 +724,7 @@ def analyze(rows):
     if not rows:
         return rep
 
-    # ---------------------------------------------------- profil signallari
+    # ---------------------------------------------------- сигналы профиля
     for r in rows:
         if r["username"]:
             rep.with_username += 1
@@ -737,7 +737,7 @@ def analyze(rows):
         if r["is_scam"] or r["is_fake"]:
             rep.flagged += 1
 
-    # ---------------------------------------------------- username oilalari
+    # ---------------------------------------------------- семейства username
     buckets = defaultdict(Family)
     for r in rows:
         prefix, number = split_username(r["username"])
@@ -758,14 +758,14 @@ def analyze(rows):
     for fam in rep.families:
         rep.family_users |= fam.user_ids
 
-    # Oila kichik bo'lsa ham generator izi ko'rinib turadi:
-    # "ruslanpn66344", "behzod6385" — har biri yolg'iz, lekin naqsh bitta.
+    # След генератора виден и без семейства:
+    # "ruslanpn66344", "behzod6385" — каждый сам по себе, но шаблон один.
     rep.generated_users = {
         r["user_id"] for r in rows
         if is_generated(r["username"], r["is_premium"])
     }
 
-    # ---------------------------------------------------- vaqt to'lqinlari
+    # ---------------------------------------------------- всплески во времени
     dates = sorted(parse_dt(r["request_date"]) for r in rows)
     rep.first, rep.last = dates[0], dates[-1]
     rep.span_minutes = (rep.last - rep.first).total_seconds() / 60
@@ -790,7 +790,7 @@ def analyze(rows):
 
     rep.peak60 = _peak_window(dates, 60)
 
-    # ---------------------------------------------------- quyish seanslari
+    # ---------------------------------------------------- сессии залива
     rep.windows = _sessions(by_minute, hot, rows)
     organic = [r for r in rows if r["user_id"] not in rep.burst_users] or rows
     rep.base_photo_rate = sum(1 for r in organic if r["has_photo"]) / len(organic)
@@ -804,8 +804,8 @@ def analyze(rows):
         win.family_share = sum(
             1 for r in win.rows if r["user_id"] in rep.family_users
         ) / n
-        # Tirik auditoriya "chala" bo'ladi. Seansda rasm/username ulushi
-        # umumiy fondan sezilarli yuqori bo'lsa — akkauntlar tayyorlangan.
+        # Живая аудитория «неполная». Если доля аватарок/username в сессии
+        # заметно выше общего фона — аккаунты готовили.
         win.uniform = (
             win.photo_rate - rep.base_photo_rate >= config.UNIFORMITY_GAP
             or win.username_rate - rep.base_username_rate >= config.UNIFORMITY_GAP
@@ -813,14 +813,13 @@ def analyze(rows):
         if win.uniform:
             rep.uniform_users |= {r["user_id"] for r in win.rows}
 
-    # ---------------------------------------------------- user_id klasterlari
-    # ---------------------------------------------------- rasm partiyalari
-    # Tirik odam rasmini o'zi xohlagan kuni qo'yadi. Bir necha yuz akkaunt
-    # aynan bir kunda rasm yuklagan bo'lsa — ular birga tayyorlangan.
+    # ---------------------------------------------------- партии аватарок
+    # Живой человек ставит фото тогда, когда ему захотелось. Если несколько
+    # сотен аккаунтов загрузили фото в один день — их готовили вместе.
     deep = [r for r in rows if r["photo_count"] is not None]
     rep.deep_total = len(deep)
     if deep:
-        # 5+ rasmi bor akkaunt — tirik odam. Uni partiyaga qo'shmaymiz.
+        # Аккаунт с 5+ фото — живой человек. В партию его не записываем.
         rep.human_users = {
             r["user_id"] for r in deep
             if r["photo_count"] >= config.HUMAN_PHOTOS
@@ -840,7 +839,7 @@ def analyze(rows):
         if len(members) >= config.CLUSTER_MIN:
             rep.cluster_users |= set(members)
 
-    # ---------------------------------------------------- risk ballari
+    # ---------------------------------------------------- оценки риска
     family_size = {}
     for fam in rep.families:
         for uid in fam.user_ids:
@@ -857,12 +856,12 @@ def analyze(rows):
         reverse=True,
     )
 
-    # ---------------------------------------------------- kanal risk balli
+    # ---------------------------------------------------- риск канала
     #
-    # Risk = guruh dalili bor akkauntlar ulushi. "Guruh dalili" deganda
-    # yakka profil emas, balki boshqalar bilan bog'liqlik tushuniladi:
-    # bir xil username oilasi, bir xil profilli quyish seansi, ID klasteri.
-    # Bu yakka signallarga (rasm yo'q) qaraganda ancha ishonchli.
+    # Риск = доля аккаунтов с групповой уликой. «Групповая улика» — это не
+    # сам по себе профиль, а связь с другими: общее семейство username,
+    # сессия залива с однородными профилями, кластер ID.
+    # Это гораздо надёжнее одиночных сигналов вроде «нет аватарки».
     rep.flagged_users = (
         rep.uniform_users | rep.family_users | rep.cluster_users
         | rep.generated_users | rep.batch_users
@@ -872,7 +871,7 @@ def analyze(rows):
 
 
 def _peak_window(sorted_dates, seconds):
-    """Eng zich `seconds` soniyalik siljuvchi oyna: (nechta, boshlanish vaqti)."""
+    """Самое плотное скользящее окно в `seconds`: (сколько, начало)."""
     best_count, best_start = 0, None
     left = 0
     for right, dt in enumerate(sorted_dates):
@@ -885,7 +884,7 @@ def _peak_window(sorted_dates, seconds):
 
 
 def _sessions(by_minute, hot, rows):
-    """Yonma-yon to'lqin daqiqalarini bitta seansga birlashtiradi."""
+    """Склеивает соседние горячие минуты в одну сессию."""
     if not hot:
         return []
 
@@ -911,15 +910,19 @@ def _sessions(by_minute, hot, rows):
     for win in sessions:
         moments = [parse_dt(r["request_date"]) for r in win.rows]
         win.start, win.end = min(moments), max(moments)
-        # Seans ichidagi "sovuq" daqiqalar ham seansga tegishli — quyish
-        # oqimi bir zumga sekinlashgani uni alohida qilmaydi.
+        # «Холодные» минуты внутри интервала тоже принадлежат сессии:
+        # если поток на секунды просел, это не повод рвать её надвое.
         win.rows = [r for r in rows if win.start <= parse_dt(r["request_date"]) <= win.end]
 
     return sorted(sessions, key=lambda w: w.count, reverse=True)
 
 
 def _id_clusters(rows):
-    """user_id lari bir-biriga yaqin guruhlar. Ommaviy ro'yxatdan o'tish izi."""
+    """Группы с близкими user_id. След массовой регистрации.
+
+    На выдержанной ферме не работает: аккаунты куплены вразнобой и старые.
+    Ловит только свежесозданные партии.
+    """
     ids = sorted({r["user_id"] for r in rows})
     if not ids:
         return []
@@ -939,7 +942,11 @@ def _id_clusters(rows):
 
 
 def _score(row, rep, family_size):
-    """Bitta akkaunt uchun 0-100 risk balli va sabablar ro'yxati."""
+    """Оценка риска 0-100 для одного аккаунта и список причин.
+
+    Показывается пользователю, но на решение не влияет: помечаются только
+    групповые признаки (см. flagged_users).
+    """
     uid = row["user_id"]
     score = 0
     why = []
@@ -1005,13 +1012,13 @@ def _score(row, rep, family_size):
 
 
 # ================================================================
-# GRAFIK UCHUN GURUHLASH
+# ГРУППИРОВКА ДЛЯ ГРАФИКА
 # ================================================================
 
 def timeline(rep, buckets=20):
-    """Vaqtni ~`buckets` ta bo'lakka bo'lib sanaydi.
+    """Разбивает время примерно на `buckets` интервалов и считает заявки.
 
-    Qaytaradi: (label, count) ro'yxati va bo'lak uzunligi (soniya).
+    Возвращает список (подпись, количество) и длину интервала в секундах.
     """
     if not rep.rows:
         return [], 0
